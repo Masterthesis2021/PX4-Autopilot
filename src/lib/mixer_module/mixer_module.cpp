@@ -87,6 +87,13 @@ _control_latency_perf(perf_alloc(PC_ELAPSED, "control latency"))
 	uORB::Publication<test_motor_s> test_motor_pub{ORB_ID(test_motor)};
 	test_motor_pub.publish(test);
 	_motor_test.test_motor_sub.subscribe();
+
+	// Initialize all control inputs to NaN
+	for (auto &control : _output_controls) {
+		for (unsigned i = 0; i < output_control_s::MAX_ACTUATORS; i++) {
+			control.value[i] = NAN;
+		}
+	}
 }
 
 MixingOutput::~MixingOutput()
@@ -535,9 +542,10 @@ bool MixingOutput::update()
 		if (PX4_ISFINITE(val)) {
 			_current_inputs[i] = val;
 			mixed_outputs_mask |= (1 << i);
-			mixed_num_outputs = (i > mixed_num_outputs) ? (i + 1) : mixed_num_outputs;
+			mixed_num_outputs = (i >= mixed_num_outputs) ? (i + 1) : mixed_num_outputs;
 		}
 	}
+
 
 	/* the output limit call takes care of out of band errors, NaN and constrains */
 	output_limit_calc(_throttle_armed, armNoThrottle(), _max_num_outputs, _reverse_output_mask,
@@ -567,8 +575,7 @@ bool MixingOutput::update()
 	/* Zero out any outputs which do not have a function assigned */
 	for (unsigned i = 0; i < _max_num_outputs; i++) {
 		if (_assigned_function[i] == output_control_s::FUNCTION_NONE) {
-			/// TODO: Are there any sitatuations where we would want a different "off" value?
-			_current_output_value[i] = 0;
+			_current_output_value[i] = NAN;
 		}
 	}
 

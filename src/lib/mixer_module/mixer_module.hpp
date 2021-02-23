@@ -271,6 +271,7 @@ private:
 	output_control_s _output_controls[output_control_s::NUM_OUTPUT_CONTROL_GROUPS] {};
 	actuator_armed_s _armed{};
 
+	float _mixer_outputs[MAX_ACTUATORS] {NAN};
 	uint16_t _assigned_function[MAX_ACTUATORS] {}; ///< 'output_control' function assigned to every physical output
 	const char *_output_module_prefix; ///< The parameter-name prefix of the output module, e.g. 'PWM_MAIN'
 
