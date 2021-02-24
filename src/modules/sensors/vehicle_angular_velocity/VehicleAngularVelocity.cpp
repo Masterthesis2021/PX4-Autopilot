@@ -103,41 +103,31 @@ bool VehicleAngularVelocity::UpdateSampleRate()
 			PX4_DEBUG("resetting filters, sample rate: %.3f Hz -> %.3f Hz", (double)_filter_sample_rate_hz, (double)sample_rate_hz);
 			_reset_filters = true;
 			_filter_sample_rate_hz = sample_rate_hz;
-		}
 
-		if (_reset_filters || (_required_sample_updates == 0)) {
 			if (_param_imu_gyro_rate_max.get() > 0) {
 				// determine number of sensor samples that will get closest to the desired rate
 				const float configured_interval_us = 1e6f / _param_imu_gyro_rate_max.get();
 				const float publish_interval_us = 1e6f / publish_rate_hz;
 
 				if (_fifo_available) {
-					//const uint8_t samples = math::constrain(roundf(configured_interval_us / publish_interval_us), 1.f, (float)sensor_gyro_fifo_s::ORB_QUEUE_LENGTH);
-					//_sensor_fifo_sub.set_required_updates(samples);
-					_required_sample_updates = 1; //samples;
+					const uint8_t samples = math::constrain((int)roundf(configured_interval_us / publish_interval_us), 1,
+										(int)sensor_gyro_fifo_s::ORB_QUEUE_LENGTH);
+					_sensor_fifo_sub.set_required_updates(samples);
 
 				} else {
-					const uint8_t samples = math::constrain(roundf(configured_interval_us / publish_interval_us), 1.f,
-										(float)sensor_gyro_s::ORB_QUEUE_LENGTH);
+					const uint8_t samples = math::constrain((int)roundf(configured_interval_us / publish_interval_us), 1,
+										(int)sensor_gyro_s::ORB_QUEUE_LENGTH);
 					_sensor_sub.set_required_updates(samples);
-					_required_sample_updates = samples;
 				}
+
+				// publish interval
+				_publish_interval_min_us = roundf(configured_interval_us - (publish_interval_us / 2.f));
 
 			} else {
 				_sensor_sub.set_required_updates(1);
 				_sensor_fifo_sub.set_required_updates(1);
-				_required_sample_updates = 1;
+				_publish_interval_min_us = 0;
 			}
-		}
-
-		// publish interval
-		if (_param_imu_gyro_rate_max.get() > 0) {
-			const float imu_gyro_interval = 1e6f / _param_imu_gyro_rate_max.get();
-			const float publish_interval_us = 1e6f / publish_rate_hz;
-			_publish_interval_min_us = roundf(imu_gyro_interval - (publish_interval_us / 2.f));
-
-		} else {
-			_publish_interval_min_us = 0;
 		}
 
 		return true;
@@ -180,13 +170,11 @@ void VehicleAngularVelocity::SensorBiasUpdate(bool force)
 	if (_estimator_sensor_bias_sub.updated() || force) {
 		estimator_sensor_bias_s bias;
 
-		if (_estimator_sensor_bias_sub.copy(&bias)) {
-			if (bias.gyro_device_id == _selected_sensor_device_id) {
-				_bias = Vector3f{bias.gyro_bias};
+		if (_estimator_sensor_bias_sub.copy(&bias) && (bias.gyro_device_id == _selected_sensor_device_id)) {
+			_bias = Vector3f{bias.gyro_bias};
 
-			} else {
-				_bias.zero();
-			}
+		} else {
+			_bias.zero();
 		}
 	}
 }
@@ -306,6 +294,58 @@ void VehicleAngularVelocity::Run()
 	ParametersUpdate();
 
 	if (_fifo_available) {
+
+		// dynamic notch filter update
+		if (_filter_sample_rate_hz > 0.f) {
+			sensor_gyro_fft_s sensor_gyro_fft;
+
+			if (_sensor_gyro_fft_sub.update(&sensor_gyro_fft)) {
+				if (sensor_gyro_fft.device_id == _selected_sensor_device_id) {
+					for (int i = 0; i < MAX_NUM_FFT_PEAKS; i++) {
+						for (int axis = 0; axis < 3; axis++) {
+
+							float *peak_frequencies = nullptr;
+
+							switch (axis) {
+							case 0:
+								peak_frequencies = sensor_gyro_fft.peak_frequencies_x;
+								break;
+
+							case 1:
+								peak_frequencies = sensor_gyro_fft.peak_frequencies_y;
+								break;
+
+							case 2:
+								peak_frequencies = sensor_gyro_fft.peak_frequencies_z;
+								break;
+							}
+
+							if (PX4_ISFINITE(peak_frequencies[i]) && (peak_frequencies[i] > DYNAMIC_NOTCH_FILTER_MIN_FREQ_HZ)) {
+								_dynamic_notch_filter[i][axis].setParameters(_filter_sample_rate_hz, peak_frequencies[i],
+										sensor_gyro_fft.resolution_hz);
+
+								if (fabsf(_dynamic_notch_filter[i][axis].getNotchFreq() - peak_frequencies[i]) > 1.f) {
+									_dynamic_notch_filter[i][axis].reset(_angular_velocity(axis));
+								}
+
+							} else {
+								// disable
+								_dynamic_notch_filter[i][axis].setParameters(_filter_sample_rate_hz, 0, sensor_gyro_fft.resolution_hz);
+							}
+						}
+					}
+
+				} else {
+					// device id mismatch, disable all
+					for (auto &dnf : _dynamic_notch_filter) {
+						for (int axis = 0; axis < 3; axis++) {
+							dnf[axis].setParameters(_filter_sample_rate_hz, 0, sensor_gyro_fft.resolution_hz);
+						}
+					}
+				}
+			}
+		}
+
 		// process all outstanding fifo messages
 		sensor_gyro_fifo_s sensor_fifo_data;
 
@@ -355,6 +395,13 @@ void VehicleAngularVelocity::Run()
 						data[n] = raw_data[n];
 					}
 
+					// Apply dynamic notch filter from FFT
+					for (auto &dnf : _dynamic_notch_filter) {
+						if (dnf[axis].getNotchFreq() > DYNAMIC_NOTCH_FILTER_MIN_FREQ_HZ) {
+							dnf[axis].applyDF1(data, N);
+						}
+					}
+
 					// Apply general notch filter (IMU_GYRO_NF_FREQ)
 					if (_notch_filter_velocity[axis].getNotchFreq() > 0.f) {
 						_notch_filter_velocity[axis].apply(data, N);
@@ -378,12 +425,12 @@ void VehicleAngularVelocity::Run()
 
 				// Angular velocity: rotate sensor frame to board, scale raw data to SI, apply calibration, and remove in-run estimated bias
 				rotate_3f(fifo_rotation, angular_velocity_unscaled(0), angular_velocity_unscaled(1), angular_velocity_unscaled(2));
-				_angular_velocity = Vector3f{_calibration.Correct(angular_velocity_unscaled * sensor_fifo_data.scale) - _bias};
+				_angular_velocity = _calibration.Correct(angular_velocity_unscaled * sensor_fifo_data.scale) - _bias;
 
 				// Angular acceleration: rotate sensor frame to board, scale raw data to SI, apply any additional configured rotation
 				rotate_3f(fifo_rotation, angular_acceleration_unscaled(0), angular_acceleration_unscaled(1),
 					  angular_acceleration_unscaled(2));
-				_angular_acceleration = Vector3f{_calibration.rotation() *angular_acceleration_unscaled * sensor_fifo_data.scale};
+				_angular_acceleration = _calibration.rotation() * angular_acceleration_unscaled * sensor_fifo_data.scale;
 
 				// Publish
 				if (!_sensor_fifo_sub.updated() && (sensor_fifo_data.timestamp_sample - _last_publish >= _publish_interval_min_us)) {

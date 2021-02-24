@@ -50,6 +50,7 @@
 #include <uORB/topics/estimator_sensor_bias.h>
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/sensor_gyro.h>
+#include <uORB/topics/sensor_gyro_fft.h>
 #include <uORB/topics/sensor_gyro_fifo.h>
 #include <uORB/topics/sensor_selection.h>
 #include <uORB/topics/vehicle_angular_acceleration.h>
@@ -84,12 +85,14 @@ private:
 	void Publish(const hrt_abstime &timestamp_sample);
 
 	static constexpr int MAX_SENSOR_COUNT = 4;
+	static constexpr float DYNAMIC_NOTCH_FILTER_MIN_FREQ_HZ = 10.f;
 
 	uORB::Publication<vehicle_angular_acceleration_s> _vehicle_angular_acceleration_pub{ORB_ID(vehicle_angular_acceleration)};
 	uORB::Publication<vehicle_angular_velocity_s>     _vehicle_angular_velocity_pub{ORB_ID(vehicle_angular_velocity)};
 
 	uORB::Subscription _estimator_selector_status_sub{ORB_ID(estimator_selector_status)};
 	uORB::Subscription _estimator_sensor_bias_sub{ORB_ID(estimator_sensor_bias)};
+	uORB::Subscription _sensor_gyro_fft_sub{ORB_ID(sensor_gyro_fft)};
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
@@ -111,11 +114,14 @@ private:
 	hrt_abstime _last_publish{0};
 	static constexpr const float kInitialRateHz{1000.f}; /**< sensor update rate used for initialization */
 	float _filter_sample_rate_hz{kInitialRateHz};
-	uint8_t _required_sample_updates{0}; /**< number or sensor publications required for configured rate */
+
+	static constexpr int MAX_NUM_FFT_PEAKS = sizeof(sensor_gyro_fft_s::peak_frequencies_x) / sizeof(
+				sensor_gyro_fft_s::peak_frequencies_x[0]);
 
 	// angular velocity filters
 	math::LowPassFilter2pArray _lp_filter_velocity[3] {{kInitialRateHz, 30.f}, {kInitialRateHz, 30.f}, {kInitialRateHz, 30.f}};
 	math::NotchFilterArray<float> _notch_filter_velocity[3] {};
+	math::NotchFilterArray<float> _dynamic_notch_filter[MAX_NUM_FFT_PEAKS][3] {};
 
 	// angular acceleration filter
 	math::LowPassFilter2p _lp_filter_acceleration[3] {{kInitialRateHz, 30.f}, {kInitialRateHz, 30.f}, {kInitialRateHz, 30.f}};
